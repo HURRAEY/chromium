@@ -30,6 +30,7 @@
 
 #include "third_party/blink/renderer/core/html/html_slot_element.h"
 
+#include <algorithm>
 #include <ranges>
 
 #include "base/check.h"
@@ -606,37 +607,12 @@ void HTMLSlotElement::NotifySlottedNodesOfFlatTreeChange(
     return;
   probe::DidPerformSlotDistribution(this);
 
-  // It is very important to minimize the number of reattaching nodes in
-  // |new_assigned_nodes| here. The following *works*, in terms of the
-  // correctness of the rendering,
-  //
-  // for (auto& node: new_slotted) {
-  //   node->ParentSlotChanged();
-  // }
-  //
-  // However, reattaching all ndoes is not good in terms of performance.
-  // Reattach is very expensive operation.
-  //
-  // A possible approach is: Find the Longest Commons Subsequence (LCS) between
-  // |old_slotted| and |new_slotted|, and reattach nodes in |new_slotted| which
-  // LCS does not include.
-  //
-  // Note that a relative order between nodes which are not reattached should be
-  // preserved in old and new. For example,
-  //
-  // - old: [1, 4, 2, 3]
-  // - new: [3, 1, 2]
-  //
-  // This case, we must reattach 3 here, as the best possible solution.  If we
-  // don't reattach 3, 3's LayoutObject will have an invalid next sibling
-  // pointer.  We don't have any chance to update their sibling pointers (3's
-  // next and 1's previous).  Sibling pointers between 1 and 2 are correctly
-  // updated when we reattach 4, which is done in another code path.
+  // Keep the longest common subsequence so that nodes that retain their
+  // relative order can keep their layout objects attached.
   if (old_slotted.size() + 1 > kLCSTableSizeLimit ||
       new_slotted.size() + 1 > kLCSTableSizeLimit) {
-    // Since DP takes O(N^2), we don't use DP if the size is larger than the
-    // pre-defined limit.
-    NotifySlottedNodesOfFlatTreeChangeNaive(old_slotted, new_slotted);
+    NotifySlottedNodesOfFlatTreeChangeByIncreasingSubsequence(old_slotted,
+                                                              new_slotted);
   } else {
     NotifySlottedNodesOfFlatTreeChangeByDynamicProgramming(old_slotted,
                                                            new_slotted);
@@ -656,115 +632,85 @@ void HTMLSlotElement::DidSlotChangeAfterRenaming() {
   CheckSlotChange(SlotChangeType::kSuppressSlotChangeEvent);
 }
 
-void HTMLSlotElement::NotifySlottedNodesOfFlatTreeChangeNaive(
-    const HeapVector<Member<Node>>& old_assigned_nodes,
-    const HeapVector<Member<Node>>& new_assigned_nodes) {
-  // Use O(N) naive greedy algorithm to find a *suboptimal* longest common
-  // subsequence (LCS), and reattach nodes which are not in suboptimal LCS.  We
-  // run a greedy algorithm twice in both directions (scan forward and scan
-  // backward), and use the better result.  Though this greedy algorithm is not
-  // perfect, it works well in some common cases, such as:
+void HTMLSlotElement::NotifySlottedNodesOfFlatTreeChangeByIncreasingSubsequence(
+    const HeapVector<Member<Node>>& old_slotted,
+    const HeapVector<Member<Node>>& new_slotted) {
+  wtf_size_t begin = 0;
+  wtf_size_t old_end = old_slotted.size();
+  wtf_size_t new_end = new_slotted.size();
 
-  // Inserting a node:
-  // old assigned nodes: [a, b ...., z]
-  // new assigned nodes: [a, b ...., z, A]
-  // => The algorithm reattaches only node |A|.
-
-  // Removing a node:
-  // - old assigned nodes: [a, b, ..., m, n, o, ..., z]
-  // - new assigned nodes: [a, b, ..., m, o, ... , z]
-  // => The algorithm does not reattach any node.
-
-  // Moving a node:
-  // - old assigned nodes: [a, b, ..., z]
-  // - new assigned nodes: [b, ..., z, a]
-  // => The algorithm reattaches only node |a|.
-
-  // Swapping the first node and the last node
-  // - old assigned nodes: [a, b, ..., y, z]
-  // - new assigned nodes: [z, b, ..., y, a]
-  // => Ideally, we should reattach only |a| and |z|, however, the algorithm
-  // does not work well here, reattaching [a, b, ...., y] (or [b, ... y, z]).
-  // We could reconsider to support this case if a compelling case arises.
-
-  // TODO(hayato): Consider to write an unit test for the algorithm.  We
-  // probably want to make the algorithm templatized so we can test it
-  // easily.  Like, Vec<T> greedy_suboptimal_lcs(Vec<T> old, Vec<T> new)
-
-  HeapHashMap<Member<Node>, wtf_size_t> old_index_map;
-  for (wtf_size_t i = 0; i < old_assigned_nodes.size(); ++i) {
-    old_index_map.insert(old_assigned_nodes[i], i);
+  // Skip unchanged ends. Appends and removals at either end need no index.
+  while (begin < old_end && begin < new_end &&
+         old_slotted[begin] == new_slotted[begin]) {
+    ++begin;
+  }
+  while (begin < old_end && begin < new_end &&
+         old_slotted[old_end - 1] == new_slotted[new_end - 1]) {
+    --old_end;
+    --new_end;
+  }
+  if (begin == new_end) {
+    return;
   }
 
-  // Scan forward
-  HeapVector<Member<Node>> forward_result;
-
-  wtf_size_t i = 0;
-  wtf_size_t j = 0;
-
-  while (i < old_assigned_nodes.size() && j < new_assigned_nodes.size()) {
-    auto& new_node = new_assigned_nodes[j];
-    if (old_assigned_nodes[i] == new_node) {
-      ++i;
-      ++j;
-      continue;
+  Vector<wtf_size_t, kLCSTableSizeLimit> predecessors;
+  wtf_size_t next_preserved = kNotFound;
+  if (begin < old_end) {
+    HeapHashMap<Member<Node>, wtf_size_t> old_indices;
+    old_indices.ReserveCapacityForSize(old_end - begin);
+    for (wtf_size_t i = begin; i < old_end; ++i) {
+      old_indices.insert(old_slotted[i], i);
     }
-    if (auto it = old_index_map.find(new_node);
-        it != old_index_map.end()) {
-      wtf_size_t old_index = it->value;
-      if (old_index > i) {
-        i = old_index + 1;
-        ++j;
+
+    // Each node occurs at most once in either list. The longest increasing
+    // subsequence of old indices is therefore the longest common subsequence.
+    // Keep the lowest old index that can end a subsequence of each length.
+    struct SubsequenceEnd {
+      wtf_size_t old_index;
+      wtf_size_t new_index;
+    };
+    Vector<SubsequenceEnd, kLCSTableSizeLimit> ends;
+    predecessors.resize(new_end - begin);
+    for (wtf_size_t i = begin; i < new_end; ++i) {
+      auto found = old_indices.find(new_slotted[i]);
+      if (found == old_indices.end()) {
         continue;
       }
-    }
-    forward_result.push_back(new_node);
-    ++j;
-  }
 
-  for (; j < new_assigned_nodes.size(); ++j) {
-    forward_result.push_back(new_assigned_nodes[j]);
-  }
-
-  // Scan backward
-  HeapVector<Member<Node>> backward_result;
-
-  i = old_assigned_nodes.size();
-  j = new_assigned_nodes.size();
-
-  while (i > 0 && j > 0) {
-    auto& new_node = new_assigned_nodes[j - 1];
-    if (old_assigned_nodes[i - 1] == new_node) {
-      --i;
-      --j;
-      continue;
-    }
-    if (auto it = old_index_map.find(new_node);
-        it != old_index_map.end()) {
-      wtf_size_t old_index = it->value;
-      if (old_index < i - 1) {
-        i = old_index;
-        --j;
-        continue;
+      const wtf_size_t old_index = found->value;
+      wtf_size_t position = ends.size();
+      if (!ends.empty() && old_index < ends.back().old_index) {
+        const auto bound = std::ranges::lower_bound(ends, old_index, {},
+                                                    &SubsequenceEnd::old_index);
+        position =
+            static_cast<wtf_size_t>(std::ranges::distance(ends.begin(), bound));
+      }
+      predecessors[i - begin] =
+          position == 0 ? kNotFound : ends[position - 1].new_index;
+      if (position == ends.size()) {
+        ends.push_back(SubsequenceEnd{old_index, i});
+      } else {
+        ends[position] = {old_index, i};
       }
     }
-    backward_result.push_back(new_node);
-    --j;
+    if (!ends.empty()) {
+      next_preserved = ends.back().new_index;
+    }
   }
 
-  for (; j > 0; --j) {
-    backward_result.push_back(new_assigned_nodes[j - 1]);
+  // Collect the notifications before calling into code that can re-enter
+  // slot assignment and change the flat tree children.
+  HeapVector<Member<Node>> nodes_to_reattach;
+  for (wtf_size_t i = new_end; i > begin; --i) {
+    const wtf_size_t index = i - 1;
+    if (index == next_preserved) {
+      next_preserved = predecessors[index - begin];
+    } else {
+      nodes_to_reattach.push_back(new_slotted[index]);
+    }
   }
-
-  // Reattach nodes
-  if (forward_result.size() <= backward_result.size()) {
-    for (auto& node : forward_result) {
-      node->ParentSlotChanged();
-    }
-  } else {
-    for (auto& node : backward_result) {
-      node->ParentSlotChanged();
-    }
+  for (const auto& node : nodes_to_reattach) {
+    node->ParentSlotChanged();
   }
 }
 

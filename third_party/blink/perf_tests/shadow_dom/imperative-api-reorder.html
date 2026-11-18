@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<!-- Copyright 2026 The Chromium Authors
+     Use of this source code is governed by a BSD-style license that can be
+     found in the LICENSE file. -->
+<script src="../resources/runner.js"></script>
+<div id="parent"></div>
+<script>
+const nodeCount = 500;
+const iterations = 20;
+let host;
+let slot;
+let original;
+let swapped;
+
+PerfTestRunner.measureTime({
+  description: "Swap the first and last of 500 manually slotted nodes and update layout.",
+  setup() {
+    host = document.createElement("div");
+    const root = host.attachShadow({mode: "open", slotAssignment: "manual"});
+    slot = root.appendChild(document.createElement("slot"));
+    original = Array.from({length: nodeCount}, (_, index) => {
+      const row = document.createElement("div");
+      row.textContent = index;
+      return row;
+    });
+    host.append(...original);
+    document.getElementById("parent").appendChild(host);
+    swapped = original.slice();
+    [swapped[0], swapped[nodeCount - 1]] =
+        [swapped[nodeCount - 1], swapped[0]];
+    slot.assign(...original);
+    host.offsetHeight;
+  },
+  run() {
+    for (let i = 0; i < iterations; ++i) {
+      slot.assign(...(i % 2 === 0 ? swapped : original));
+      host.offsetHeight;
+    }
+  },
+  teardown() {
+    host.remove();
+  },
+});
+</script>

@@ -10,6 +10,9 @@
 #include "third_party/blink/renderer/core/dom/flat_tree_traversal.h"
 #include "third_party/blink/renderer/core/dom/shadow_root.h"
 #include "third_party/blink/renderer/core/frame/local_frame_view.h"
+#include "third_party/blink/renderer/core/html/custom/custom_element_registry_assignment.h"
+#include "third_party/blink/renderer/core/html_names.h"
+#include "third_party/blink/renderer/core/layout/layout_object.h"
 #include "third_party/blink/renderer/core/style/computed_style.h"
 #include "third_party/blink/renderer/core/testing/dummy_page_holder.h"
 #include "third_party/blink/renderer/platform/bindings/exception_state.h"
@@ -178,6 +181,45 @@ TEST_F(HTMLSlotElementInDocumentTest, RecalcAssignedNodeStyleForReattach) {
 
   EXPECT_TRUE(shadow_span->GetComputedStyle());
   EXPECT_TRUE(span.GetComputedStyle());
+}
+
+TEST_F(HTMLSlotElementInDocumentTest, ReattachOnlySwappedSlotChildren) {
+  GetDocument().body()->SetInnerHTMLWithoutTrustedTypes("<div id=host></div>");
+  auto* host = GetDocument().getElementById(AtomicString("host"));
+  ShadowRoot& shadow_root = host->AttachShadowRootInternal(
+      ShadowRootMode::kOpen, FocusDelegation::kNone,
+      SlotAssignmentMode::kManual, CustomElementRegistryAssignment::Inherit(),
+      /*serializable=*/false, /*clonable=*/false,
+      /*reference_target=*/g_null_atom);
+  shadow_root.SetInnerHTMLWithoutTrustedTypes("<slot></slot>");
+  auto* slot = To<HTMLSlotElement>(shadow_root.firstChild());
+
+  // The list is large enough to exercise the large-list comparison.
+  HeapVector<Member<Node>> children;
+  for (int i = 0; i < kTableSize; ++i) {
+    auto* child = GetDocument().CreateRawElement(html_names::kDivTag);
+    host->appendChild(child);
+    children.push_back(child);
+  }
+  slot->Assign(children);
+  GetDocument().View()->UpdateAllLifecyclePhasesForTest();
+
+  std::swap(children.front(), children.back());
+  slot->Assign(children);
+  EXPECT_EQ(children, slot->AssignedNodes());
+  EXPECT_TRUE(children.front()->GetForceReattachLayoutTree());
+  EXPECT_TRUE(children.back()->GetForceReattachLayoutTree());
+  for (wtf_size_t i = 1; i + 1 < children.size(); ++i) {
+    EXPECT_FALSE(children[i]->GetForceReattachLayoutTree()) << i;
+  }
+
+  GetDocument().View()->UpdateAllLifecyclePhasesForTest();
+  for (wtf_size_t i = 0; i + 1 < children.size(); ++i) {
+    ASSERT_TRUE(children[i]->GetLayoutObject());
+    ASSERT_TRUE(children[i + 1]->GetLayoutObject());
+    EXPECT_EQ(children[i + 1]->GetLayoutObject(),
+              children[i]->GetLayoutObject()->NextSibling());
+  }
 }
 
 TEST_F(HTMLSlotElementInDocumentTest, SlotableFallback) {
